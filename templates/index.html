@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Network Device Directory</title>
+  <meta name="description" content="Search and document devices on the local network.">
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24"><path d="M4 11.5a12 12 0 0 1 16 0M7.5 15a7 7 0 0 1 9 0M11 18.5a1.5 1.5 0 1 1 2 0"/></svg>
+      </div>
+      <div>
+        <h1>Network Device Directory</h1>
+        <p>{{ network_cidr }}</p>
+      </div>
+    </div>
+    <div class="header-actions">
+      <button class="button secondary" id="piholeButton">Connect Pi-hole</button>
+      <button class="button secondary" id="haButton">Connect Home Assistant</button>
+      <button class="button secondary" id="eeroButton">Connect eero</button>
+      <button class="button primary" id="scanButton">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.34-5.66M20 4v6h-6"/></svg>
+        Scan network
+      </button>
+    </div>
+  </header>
+
+  <main>
+    <section class="summary" aria-label="Network summary">
+      <div class="summary-card"><span>Known devices</span><strong id="knownCount">—</strong></div>
+      <div class="summary-card"><span>Online now</span><strong id="onlineCount">—</strong></div>
+      <div class="summary-card"><span>eero reservations</span><strong id="reservationCount">—</strong></div>
+      <div class="summary-card status-card">
+        <span>Last updated</span><strong id="lastUpdated">Not scanned yet</strong>
+      </div>
+    </section>
+
+    <section class="workspace">
+      <div class="toolbar">
+        <label class="search-box">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg>
+          <span class="sr-only">Search devices</span>
+          <input id="searchInput" type="search" placeholder="Search IP, name, MAC, manufacturer, room…" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+        <div class="filters" role="group" aria-label="Filter devices">
+          <button class="filter active" data-filter="all">All</button>
+          <button class="filter" data-filter="online">Online</button>
+          <button class="filter" data-filter="offline">Offline</button>
+          <button class="filter" data-filter="reserved">Reserved</button>
+          <button class="filter" data-filter="unknown">Unidentified</button>
+        </div>
+        <button class="icon-button" id="addButton" aria-label="Add a device manually" title="Add a device manually">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        </button>
+      </div>
+
+      <div class="notice hidden" id="notice" role="status"></div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Device</th>
+              <th>IP address</th>
+              <th>MAC / manufacturer</th>
+              <th>Location</th>
+              <th>Status</th>
+              <th><span class="sr-only">Actions</span></th>
+            </tr>
+          </thead>
+          <tbody id="deviceRows"></tbody>
+        </table>
+        <div class="empty hidden" id="emptyState">
+          <div class="empty-icon"><svg viewBox="0 0 24 24"><path d="M4 11.5a12 12 0 0 1 16 0M7.5 15a7 7 0 0 1 9 0M11 18.5a1.5 1.5 0 1 1 2 0"/></svg></div>
+          <h2>No matching devices</h2>
+          <p>Try another search or scan the network again.</p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="deviceDialog">
+    <form method="dialog" id="deviceForm">
+      <div class="dialog-head">
+        <div><p class="eyebrow">Device details</p><h2 id="deviceDialogTitle">Edit device</h2></div>
+        <button class="close-button" value="cancel" aria-label="Close">×</button>
+      </div>
+      <input type="hidden" id="deviceId">
+      <div class="detail-strip" id="deviceFacts"></div>
+      <div class="form-grid">
+        <label><span>My friendly name</span><input id="friendlyName" maxlength="100" placeholder="Example: Garage camera"></label>
+        <label><span>Device type</span><input id="deviceType" maxlength="80" placeholder="Camera, ESP32, computer…"></label>
+        <label><span>Location</span><input id="location" maxlength="100" placeholder="Garage, shop, living room…"></label>
+        <label class="full"><span>Notes</span><textarea id="notes" rows="4" maxlength="1000" placeholder="Anything useful to remember about this device"></textarea></label>
+      </div>
+      <section class="identity-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>Device identification</h3>
+            <p id="identityHelp">Combine MAC manufacturer, host information, ports, service fingerprints, and operating-system hints.</p>
+          </div>
+          <button type="button" class="button primary" id="deepScanButton">Deep scan</button>
+        </div>
+        <div id="identityResult" class="identity-result hidden">
+          <div class="identity-title"><strong id="identityName"></strong><span id="identityConfidence" class="confidence-tag"></span></div>
+          <p id="identitySummary"></p>
+          <div id="osHint" class="os-hint hidden"></div>
+          <ul id="identityEvidence"></ul>
+        </div>
+      </section>
+      <section class="dns-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>DNS traffic analysis</h3>
+            <p id="dnsHelp">Connect Pi-hole to identify this device from its DNS destinations and request patterns.</p>
+          </div>
+          <div class="dns-controls">
+            <select id="dnsLookback" aria-label="DNS history period">
+              <option value="1">Last hour</option>
+              <option value="24" selected>Last 24 hours</option>
+              <option value="168">Last 7 days</option>
+              <option value="720">Last 30 days</option>
+            </select>
+            <button type="button" class="button secondary" id="dnsAnalyzeButton">Analyze DNS</button>
+          </div>
+        </div>
+        <div id="dnsResult" class="dns-result hidden">
+          <div class="identity-title"><strong id="dnsIdentity"></strong><span id="dnsConfidence" class="confidence-tag"></span></div>
+          <p id="dnsSummary"></p>
+          <ul id="dnsEvidence"></ul>
+          <div id="dnsSources" class="dns-sources"></div>
+          <div id="dnsDomains" class="dns-domain-list"></div>
+        </div>
+      </section>
+      <section class="ha-match-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>Home Assistant / ESPHome details</h3>
+            <p id="haMatchHelp">Connect Home Assistant to match this MAC address with its device and entities.</p>
+          </div>
+        </div>
+        <div id="haMatchResult" class="ha-match-result hidden"></div>
+      </section>
+      <section class="ports-panel">
+        <div class="panel-heading">
+          <div>
+            <h3>Open TCP ports</h3>
+            <p id="portsHelp">Not scanned yet. Checks 5,000 common ports plus home-network services.</p>
+          </div>
+          <button type="button" class="button secondary" id="scanPortsButton">Scan ports</button>
+        </div>
+        <div class="ports-list" id="portsList"></div>
+      </section>
+      <section class="reservation-panel" id="reservationPanel">
+        <div><h3>eero IP reservation</h3><p id="reservationHelp">Connect eero to manage reservations.</p></div>
+        <div class="reservation-controls">
+          <input id="reservationIp" inputmode="decimal" aria-label="Reserved IP address">
+          <button type="button" class="button secondary" id="reserveButton">Add reservation</button>
+        </div>
+      </section>
+      <div class="dialog-actions">
+        <button type="button" class="button ghost" id="lookupButton">Look up MAC online</button>
+        <button type="submit" class="button primary">Save details</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="haDialog">
+    <form method="dialog" id="haForm">
+      <div class="dialog-head">
+        <div><p class="eyebrow">Read-only connection</p><h2>Connect Home Assistant</h2></div>
+        <button class="close-button" value="cancel" aria-label="Close">×</button>
+      </div>
+      <div id="haDisconnected">
+        <p class="dialog-copy">The directory will read device names, models, areas, firmware versions, entities, and current states. It will not change Home Assistant or retrieve encryption keys.</p>
+        <label><span>Home Assistant URL</span><input id="haUrl" value="http://homeassistant.local:8123" autocomplete="url"></label>
+        <label class="token-label"><span>Long-lived access token</span><textarea id="haToken" rows="5" autocomplete="off" spellcheck="false"></textarea></label>
+        <p class="credential-help">Create a dedicated non-administrator Home Assistant user, sign in as that user, then create a long-lived token from its Profile page. The token stays on this Docker host.</p>
+        <button type="button" class="button primary wide" id="haConnectButton">Connect and match devices</button>
+      </div>
+      <div id="haConnected" class="hidden connected-panel">
+        <div class="connected-badge"><span></span>Connected to Home Assistant</div>
+        <p id="haConnectionStatus">Device and entity information can now be matched by MAC address.</p>
+        <button type="button" class="button primary wide" id="haSyncButton">Sync Home Assistant now</button>
+        <button type="button" class="button ghost wide" id="haDisconnectButton">Disconnect Home Assistant</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="piholeDialog">
+    <form method="dialog" id="piholeForm">
+      <div class="dialog-head">
+        <div><p class="eyebrow">Read-only DNS history</p><h2>Connect Pi-hole</h2></div>
+        <button class="close-button" value="cancel" aria-label="Close">×</button>
+      </div>
+      <div id="piholeDisconnected">
+        <p class="dialog-copy">Connect both Pi-hole 6 servers with their application passwords. The passwords stay on this Docker host in a restricted file and are used only for read-only query-history requests.</p>
+        <div class="pihole-source-form">
+          <h3>Primary Pi-hole (DNS1)</h3>
+          <label><span>Pi-hole URL</span><input id="piholeUrl1" placeholder="http://192.168.1.2" autocomplete="url"></label>
+          <label class="token-label"><span>Application password</span><input id="piholePassword1" type="password" autocomplete="new-password"></label>
+        </div>
+        <div class="pihole-source-form">
+          <h3>Secondary Pi-hole (DNS2)</h3>
+          <label><span>Pi-hole URL</span><input id="piholeUrl2" placeholder="http://192.168.1.3:8080" autocomplete="url"></label>
+          <label class="token-label"><span>Application password</span><input id="piholePassword2" type="password" autocomplete="new-password"></label>
+        </div>
+        <p class="credential-help">Use the application passwords from Pi-hole Settings → Web interface / API. They are never sent to the browser again after saving.</p>
+        <button type="button" class="button primary wide" id="piholeConnectButton">Connect and test both</button>
+      </div>
+      <div id="piholeConnected" class="hidden connected-panel">
+        <div class="connected-badge"><span></span>Connected to Pi-hole</div>
+        <p id="piholeConnectionStatus">DNS history is available for device analysis.</p>
+        <div id="piholeSources" class="connected-sources"></div>
+        <button type="button" class="button primary wide" id="piholeTestButton">Test connections</button>
+        <button type="button" class="button ghost wide" id="piholeDisconnectButton">Disconnect Pi-hole</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="eeroDialog">
+    <form method="dialog" id="eeroForm">
+      <div class="dialog-head">
+        <div><p class="eyebrow">Optional connection</p><h2>Connect to eero</h2></div>
+        <button class="close-button" value="cancel" aria-label="Close">×</button>
+      </div>
+      <div id="eeroDisconnected">
+        <p class="dialog-copy">Use the email address or phone number on your eero account. Eero will send you a one-time verification code.</p>
+        <label><span>Email address or phone number</span><input id="eeroIdentifier" autocomplete="username"></label>
+        <button type="button" class="button primary wide" id="sendCodeButton">Send verification code</button>
+        <div class="verify-area hidden" id="verifyArea">
+          <label><span>Verification code</span><input id="eeroCode" inputmode="numeric" autocomplete="one-time-code"></label>
+          <button type="button" class="button primary wide" id="verifyButton">Verify and import devices</button>
+        </div>
+      </div>
+      <div id="eeroConnected" class="hidden connected-panel">
+        <div class="connected-badge"><span></span>Connected to eero</div>
+        <p id="eeroNetworkName">Your device names and reservations can now be synchronized.</p>
+        <button type="button" class="button primary wide" id="syncButton">Sync eero now</button>
+        <button type="button" class="button ghost wide" id="disconnectButton">Disconnect eero</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="manualDialog">
+    <form method="dialog" id="manualForm">
+      <div class="dialog-head">
+        <div><p class="eyebrow">Manual entry</p><h2>Add a device</h2></div>
+        <button class="close-button" value="cancel" aria-label="Close">×</button>
+      </div>
+      <div class="form-grid">
+        <label><span>MAC address</span><input id="manualMac" required placeholder="AA:BB:CC:DD:EE:FF"></label>
+        <label><span>IP address</span><input id="manualIp" inputmode="decimal" placeholder="192.168.1.100"></label>
+        <label class="full"><span>Friendly name</span><input id="manualName" maxlength="100" placeholder="What is this device?"></label>
+      </div>
+      <div class="dialog-actions"><button type="submit" class="button primary">Add device</button></div>
+    </form>
+  </dialog>
+
+  <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+</body>
+</html>
