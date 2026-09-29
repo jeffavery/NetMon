@@ -12,5 +12,8 @@ services:
       APP_PORT: "8088"
       AUTO_SCAN_MINUTES: "5"
       TZ: "America/Chicago"
+      DNS_RESEARCH_ENABLED: "true"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_DNS_RESEARCH_MODEL: "${OPENAI_DNS_RESEARCH_MODEL:-gpt-5.5}"
     volumes:
       - ./data:/data

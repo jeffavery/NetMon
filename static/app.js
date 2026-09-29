@@ -125,6 +125,17 @@ function openDevice(device) {
   if (!$('#deviceDialog').open) $('#deviceDialog').showModal();
 }
 
+let dnsResearchRefreshTimer = null;
+function refreshDnsResearch(device) {
+  clearTimeout(dnsResearchRefreshTimer);
+  if (!['queued', 'running'].includes(device.dns_research_status)) return;
+  dnsResearchRefreshTimer = setTimeout(async () => {
+    await loadDevices();
+    const updated = state.devices.find(item => item.id === device.id);
+    if (updated && state.activeDevice && state.activeDevice.id === device.id) openDevice(updated);
+  }, 3000);
+}
+
 function renderDnsAnalysis(device) {
   const result = $('#dnsResult');
   if (!state.status.pihole_connected && !device.dns_scanned_at) {
@@ -140,7 +151,16 @@ function renderDnsAnalysis(device) {
     return;
   }
   result.classList.remove('hidden');
-  $('#dnsHelp').textContent = `Analyzed ${timeAgo(device.dns_scanned_at)} · ${Number(device.dns_query_count || 0).toLocaleString()} requests · ${device.dns_lookback_hours || 24}-hour lookback.`;
+  const research = device.dns_research_status === 'queued' || device.dns_research_status === 'running'
+    ? ' · researching unfamiliar domains in the background…'
+    : device.dns_research_status === 'completed'
+      ? ' · web-research finding saved'
+      : device.dns_research_status === 'no-match'
+        ? ' · web research found no reliable correlation'
+        : device.dns_research_status === 'error'
+          ? ' · web research could not be completed'
+          : '';
+  $('#dnsHelp').textContent = `Analyzed ${timeAgo(device.dns_scanned_at)} · ${Number(device.dns_query_count || 0).toLocaleString()} requests · ${device.dns_lookback_hours || 24}-hour lookback${research}`;
   $('#dnsLookback').value = String(device.dns_lookback_hours || 24);
   $('#dnsIdentity').textContent = device.dns_identity || 'DNS analysis';
   $('#dnsConfidence').textContent = `${device.dns_confidence || 'low'} confidence`;
@@ -150,8 +170,9 @@ function renderDnsAnalysis(device) {
   $('#dnsSources').innerHTML = (device.dns_source_summary || []).map(source => {
     const detail = source.error ? `error: ${source.error}` : `${Number(source.count || 0).toLocaleString()} unique requests${source.truncated ? ' (limited)' : ''}`;
     return `<span class="${source.error ? 'source-error' : ''}">${escapeHtml(source.name)}: ${escapeHtml(detail)}</span>`;
-  }).join('');
+  }).join('') + (device.dns_research_sources || []).map(source => `<a href="${escapeHtml(source.url)}" target="_blank" rel="noopener">Research: ${escapeHtml(source.title)}</a>`).join('');
   $('#dnsDomains').innerHTML = (device.dns_domains || []).map(item => `<div class="dns-domain-row"><span>${escapeHtml(item.domain)}</span><strong>${Number(item.count || 0).toLocaleString()}</strong><small>${escapeHtml((item.sources || []).join(', '))}${item.blocked ? ` · ${Number(item.blocked).toLocaleString()} blocked` : ''}</small></div>`).join('');
+  refreshDnsResearch(device);
 }
 
 function renderHaMatch(device) {
@@ -301,7 +322,7 @@ $('#dnsAnalyzeButton').addEventListener('click', async () => {
   $('#dnsHelp').textContent = 'Reading and comparing DNS history from both Pi-hole servers. Longer periods may take a minute.';
   try {
     const data = await api(`/api/devices/${state.activeDevice.id}/dns-analysis`, {method:'POST', body:JSON.stringify({hours:Number($('#dnsLookback').value)})});
-    showNotice(data.message);
+    showNotice(`${data.message}${data.report.research_queued ? ' Researching unfamiliar domains in the background.' : ''}`);
     await loadDevices();
     const updated = state.devices.find(device => device.id === state.activeDevice.id);
     if (updated) openDevice(updated);

@@ -34,6 +34,9 @@ HA_TOKEN_PATH = DATA_DIR / "home-assistant-token"
 PIHOLE_CONFIG_PATH = DATA_DIR / "pihole-connections.json"
 NETWORK_CIDR = os.getenv("NETWORK_CIDR", "192.168.1.0/24")
 AUTO_SCAN_MINUTES = max(0, int(os.getenv("AUTO_SCAN_MINUTES", "5")))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_DNS_RESEARCH_MODEL = os.getenv("OPENAI_DNS_RESEARCH_MODEL", "gpt-5.5").strip()
+DNS_RESEARCH_ENABLED = os.getenv("DNS_RESEARCH_ENABLED", "true").strip().lower() in {"1", "true", "yes"}
 MAC_RE = re.compile(r"^(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 NMAP_SERVICES_PATH = Path("/usr/share/nmap/nmap-services")
 PORT_SCAN_COUNT = 5000
@@ -177,6 +180,10 @@ def init_db():
                 dns_scan_error TEXT,
                 dns_lookback_hours INTEGER,
                 dns_query_count INTEGER,
+                dns_research_status TEXT,
+                dns_research_sources TEXT,
+                dns_researched_at TEXT,
+                dns_research_error TEXT,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_devices_ip ON devices(ip);
@@ -197,6 +204,12 @@ def init_db():
                 FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS idx_device_ip_history_ip ON device_ip_history(ip);
+
+            CREATE TABLE IF NOT EXISTS dns_research_cache (
+                domain TEXT PRIMARY KEY,
+                result TEXT NOT NULL,
+                researched_at TEXT NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(devices)")}
@@ -236,6 +249,10 @@ def init_db():
             ("dns_scan_error", "TEXT"),
             ("dns_lookback_hours", "INTEGER"),
             ("dns_query_count", "INTEGER"),
+            ("dns_research_status", "TEXT"),
+            ("dns_research_sources", "TEXT"),
+            ("dns_researched_at", "TEXT"),
+            ("dns_research_error", "TEXT"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE devices ADD COLUMN {name} {definition}")
@@ -263,11 +280,14 @@ def row_to_dict(row):
         item["identity_evidence"] = []
     for field, default in (
         ("dns_evidence", []), ("dns_domains", []), ("dns_source_summary", []),
+        ("dns_research_sources", []),
     ):
         try:
             item[field] = json.loads(item.get(field) or json.dumps(default))
         except (TypeError, json.JSONDecodeError):
             item[field] = default
+    if not item["dns_research_sources"]:
+        item["dns_research_sources"] = sources_from_text(item["dns_evidence"])
     for field, default in (
         ("mdns_info", {}), ("ha_entities", []),
         ("esphome_device_info", {}), ("esphome_entities", []),
@@ -1594,6 +1614,173 @@ def analyze_dns_queries(queries, source_counts, truncated=False):
     }
 
 
+def inconclusive_identity(value, confidence):
+    """Return true only for the deliberately cautious fallback scan outcomes."""
+    text = str(value or "").lower()
+    return not value or confidence == "low" or any(term in text for term in (
+        "unidentified", "no distinctive", "network device", "always-on iot",
+    ))
+
+
+def deep_scan_is_inconclusive(device):
+    return bool(device.get("deep_scanned_at")) and inconclusive_identity(
+        device.get("device_identity"), device.get("identity_confidence")
+    )
+
+
+def response_text(response):
+    pieces = []
+    for item in response.get("output") or []:
+        for content in item.get("content") or []:
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                pieces.append(content["text"])
+    return "\n".join(pieces).strip()
+
+
+def response_citations(response):
+    seen = set()
+    sources = []
+    for item in response.get("output") or []:
+        for content in item.get("content") or []:
+            for annotation in content.get("annotations") or []:
+                citation = annotation.get("url_citation") or {}
+                url = citation.get("url")
+                if url and url not in seen:
+                    seen.add(url)
+                    sources.append({"title": citation.get("title") or url, "url": url})
+    return sources[:6]
+
+
+def sources_from_text(items):
+    seen = set()
+    sources = []
+    for item in items or []:
+        for title, url in re.findall(r"\[([^\]]+)\]\((https?://[^)]+)\)", str(item)):
+            if url not in seen:
+                seen.add(url)
+                sources.append({"title": title.strip() or url, "url": url})
+    return sources[:6]
+
+
+def parse_research_result(raw, sources, domain):
+    text = str(raw or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\\s*|\\s*```$", "", text, flags=re.IGNORECASE)
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("The research service returned an unreadable result.") from exc
+    identity = str(value.get("identity") or "").strip()[:160]
+    confidence = str(value.get("confidence") or "low").lower()
+    summary = str(value.get("summary") or "").strip()[:700]
+    evidence = value.get("evidence") if isinstance(value.get("evidence"), list) else []
+    evidence = [str(item).strip()[:600] for item in evidence if str(item).strip()][:6]
+    embedded_sources = sources_from_text(evidence)
+    seen_urls = {item.get("url") for item in sources}
+    sources = sources + [item for item in embedded_sources if item["url"] not in seen_urls]
+    evidence = [re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", item) for item in evidence]
+    if not identity or not summary or confidence not in {"low", "medium", "high"}:
+        raise RuntimeError("The research service returned an incomplete result.")
+    return {
+        "domain": domain,
+        "identity": identity,
+        "confidence": confidence,
+        "summary": summary,
+        "evidence": evidence,
+        "sources": sources,
+    }
+
+
+def research_dns_domain(domain):
+    with db_connection() as conn:
+        cached = conn.execute("SELECT result FROM dns_research_cache WHERE domain=?", (domain,)).fetchone()
+    if cached:
+        try:
+            return json.loads(cached["result"])
+        except json.JSONDecodeError:
+            pass
+    if not DNS_RESEARCH_ENABLED or not OPENAI_API_KEY:
+        raise RuntimeError("Automatic DNS research is not configured.")
+    prompt = (
+        "Research this DNS domain to identify the manufacturer or product category of the device that contacts it: "
+        f"{domain}. Search the public web. Do not infer an exact model unless the domain itself supports it. "
+        "Return JSON only with identity, confidence (low, medium, or high), summary, and evidence (an array of short facts)."
+    )
+    response = requests.post(
+        "https://api.openai.com/v1/responses",
+        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+        json={
+            "model": OPENAI_DNS_RESEARCH_MODEL,
+            "store": False,
+            "tools": [{"type": "web_search"}],
+            "tool_choice": "required",
+            "input": prompt,
+        },
+        timeout=90,
+    )
+    response.raise_for_status()
+    result = parse_research_result(response_text(response.json()), response_citations(response.json()), domain)
+    with db_connection() as conn:
+        conn.execute(
+            "INSERT INTO dns_research_cache(domain, result, researched_at) VALUES(?, ?, ?) "
+            "ON CONFLICT(domain) DO UPDATE SET result=excluded.result, researched_at=excluded.researched_at",
+            (domain, json.dumps(result), utc_now()),
+        )
+    return result
+
+
+def run_dns_research(device_id, domains):
+    try:
+        findings = []
+        for domain in domains[:3]:
+            try:
+                findings.append(research_dns_domain(domain))
+            except (requests.RequestException, RuntimeError, ValueError):
+                continue
+        rank = {"high": 3, "medium": 2, "low": 1}
+        useful = [item for item in findings if "unidentified" not in item["identity"].lower()]
+        now = utc_now()
+        with db_connection() as conn:
+            if useful:
+                best = max(useful, key=lambda item: rank[item["confidence"]])
+                evidence = [f"Web research matched {best['domain']}: {item}" for item in best["evidence"]]
+                conn.execute(
+                    """UPDATE devices SET dns_identity=?, dns_confidence=?, dns_summary=?, dns_evidence=?,
+                       dns_research_status='completed', dns_research_sources=?, dns_researched_at=?,
+                       dns_research_error=NULL, updated_at=? WHERE id=?""",
+                    (best["identity"], best["confidence"], best["summary"], json.dumps(evidence),
+                     json.dumps(best["sources"]), now, now, device_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE devices SET dns_research_status='no-match', dns_researched_at=?, dns_research_error=NULL, updated_at=? WHERE id=?",
+                    (now, now, device_id),
+                )
+    except Exception as exc:
+        with db_connection() as conn:
+            conn.execute(
+                "UPDATE devices SET dns_research_status='error', dns_research_error=?, updated_at=? WHERE id=?",
+                ("Research could not be completed." if isinstance(exc, requests.RequestException) else str(exc)[:300], utc_now(), device_id),
+            )
+
+
+def queue_dns_research(device_id, report, device):
+    if not DNS_RESEARCH_ENABLED or not OPENAI_API_KEY:
+        return False
+    if not deep_scan_is_inconclusive(device) or not inconclusive_identity(report["identity"], report["confidence"]):
+        return False
+    domains = [item["domain"] for item in report["domains"] if "." in item.get("domain", "")][:3]
+    if not domains:
+        return False
+    with db_connection() as conn:
+        conn.execute(
+            "UPDATE devices SET dns_research_status='queued', dns_research_error=NULL, updated_at=? WHERE id=?",
+            (utc_now(), device_id),
+        )
+    threading.Thread(target=run_dns_research, args=(device_id, domains), daemon=True).start()
+    return True
+
+
 def analyze_device_dns(device_id, hours):
     if hours not in {1, 24, 168, 720}:
         raise RuntimeError("Choose a DNS history period of 1 hour, 24 hours, 7 days, or 30 days.")
@@ -1668,6 +1855,7 @@ def analyze_device_dns(device_id, hours):
                 report["query_count"], now, device_id,
             ),
         )
+    report["research_queued"] = queue_dns_research(device_id, report, row_to_dict(device))
     return report
 
 
