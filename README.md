@@ -16,7 +16,7 @@ A LAN-only Docker application for finding, documenting, identifying, and searchi
 - Matches devices by MAC address with Home Assistant and imports their device name, model, area, firmware version, entities, and current states.
 - Queries ESPHome mDNS advertisements and labels TCP port 6053 correctly as the ESPHome native API.
 - Analyzes per-device DNS history from one or two Pi-hole 6 servers, merges duplicate records, and saves a cautious identity hypothesis with its supporting domains.
-- Automatically researches unfamiliar DNS domains when both a completed Deep Scan and DNS analysis are inconclusive, then saves a cited, confidence-rated suggestion.
+- Offers an optional AI analysis button after local DNS results are available, then saves a cited, confidence-rated suggestion.
 - Remembers each device's observed IP-address history so older Pi-hole records can still be associated with the same MAC address.
 - Stores all application data in `./data` beside the Compose file.
 
@@ -50,9 +50,9 @@ Edit `compose.yaml` if needed:
 - `APP_PORT`: Web port. Default: `8088`.
 - `AUTO_SCAN_MINUTES`: Automatic scan interval. Use `0` to disable automatic scans.
 - `TZ`: Container time zone.
-- `DNS_RESEARCH_ENABLED`: Set to `false` to disable the automatic web-research fallback. It is enabled by default when an API key is configured.
+- `DNS_RESEARCH_ENABLED`: Set to `false` to hide and disable the optional AI analysis button. It is enabled by default when an API key is configured.
 
-To enable the research fallback, create a private `.env` file containing `OPENAI_API_KEY` before starting the container. Optionally set `OPENAI_DNS_RESEARCH_MODEL` (default: `gpt-5.5`). Keep `.env` owner-only; it is excluded from Git. Research sends only up to three DNS domain names—not local IP addresses, MAC addresses, friendly names, notes, or raw DNS history. Findings are cached by domain to avoid repeat lookups.
+To enable optional AI analysis of DNS traffic, create a private `.env` file containing `OPENAI_API_KEY` before starting the container. Optionally set `OPENAI_DNS_RESEARCH_MODEL` (default: `gpt-5.5`). Keep `.env` owner-only; it is excluded from Git. Research sends only up to three DNS domain names—not local IP addresses, MAC addresses, friendly names, notes, or raw DNS history. Findings are cached by domain to avoid repeat lookups.
 
 Because ARP scanning works at the local Ethernet layer, the container uses host networking plus `NET_RAW` and `NET_ADMIN`. The web application itself does not expose shell commands or accept a scan target from the browser.
 
@@ -80,7 +80,7 @@ The application uses the token only for read operations: validating the API, ret
 
 Press **Connect Pi-hole** and enter each local Pi-hole 6 URL plus its application password. The application tests both connections before saving them. Credentials are stored only in `/data/pihole-connections.json` with owner-only permissions, are never returned to the browser, and are used only to authenticate read-only query-history requests.
 
-Open a device and use **DNS traffic analysis** to inspect the last hour, 24 hours, 7 days, or 30 days. The directory searches all current, reserved, and historically observed IP addresses for that MAC, merges duplicate results from both Pi-holes, ranks the requested domains, detects regular heartbeat patterns, and compares distinctive destinations with a local device-signature catalog. If both this result and a completed Deep Scan are inconclusive, the directory can queue a background, cited web-research fallback. The saved hypothesis, confidence, explanation, evidence, source counts, research sources, and top domains remain available after the scan. A later Deep Scan can use a saved DNS conclusion as additional evidence, but does not automatically query Pi-hole.
+Open a device and use **Analyze DNS** to inspect the last hour, 24 hours, 7 days, or 30 days. This action only reads Pi-hole history, merges duplicate results, ranks domains, detects regular heartbeat patterns, and compares destinations with the local signature catalog. After those results appear, press **AI analysis of DNS traffic** if you want a separate background web-research pass over up to three saved domains. The saved hypothesis, confidence, explanation, evidence, source counts, research sources, and top domains remain available after the scan. A later Deep Scan can use a saved DNS conclusion as additional evidence, but does not automatically query Pi-hole.
 
 DNS identity is evidence, not certainty. Devices using DNS-over-HTTPS/TLS may bypass Pi-hole, and clients behind another router or DNS proxy may appear under that intermediary's address. Shared cloud and CDN domains are deliberately treated as weak evidence.
 

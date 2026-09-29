@@ -1614,20 +1614,6 @@ def analyze_dns_queries(queries, source_counts, truncated=False):
     }
 
 
-def inconclusive_identity(value, confidence):
-    """Return true only for the deliberately cautious fallback scan outcomes."""
-    text = str(value or "").lower()
-    return not value or confidence == "low" or any(term in text for term in (
-        "unidentified", "no distinctive", "network device", "always-on iot",
-    ))
-
-
-def deep_scan_is_inconclusive(device):
-    return bool(device.get("deep_scanned_at")) and inconclusive_identity(
-        device.get("device_identity"), device.get("identity_confidence")
-    )
-
-
 def response_text(response):
     pieces = []
     for item in response.get("output") or []:
@@ -1764,21 +1750,18 @@ def run_dns_research(device_id, domains):
             )
 
 
-def queue_dns_research(device_id, report, device):
+def queue_dns_research(device_id, domains):
     if not DNS_RESEARCH_ENABLED or not OPENAI_API_KEY:
-        return False
-    if not deep_scan_is_inconclusive(device) or not inconclusive_identity(report["identity"], report["confidence"]):
-        return False
-    domains = [item["domain"] for item in report["domains"] if "." in item.get("domain", "")][:3]
+        raise RuntimeError("AI analysis is not configured.")
+    domains = [item for item in domains if "." in item][:3]
     if not domains:
-        return False
+        raise RuntimeError("Run DNS analysis first so there are domains to research.")
     with db_connection() as conn:
         conn.execute(
             "UPDATE devices SET dns_research_status='queued', dns_research_error=NULL, updated_at=? WHERE id=?",
             (utc_now(), device_id),
         )
     threading.Thread(target=run_dns_research, args=(device_id, domains), daemon=True).start()
-    return True
 
 
 def analyze_device_dns(device_id, hours):
@@ -1848,14 +1831,15 @@ def analyze_device_dns(device_id, hours):
         conn.execute(
             """UPDATE devices SET dns_identity=?, dns_confidence=?, dns_summary=?, dns_evidence=?,
                dns_domains=?, dns_source_summary=?, dns_scanned_at=?, dns_scan_error=NULL,
-               dns_lookback_hours=?, dns_query_count=?, updated_at=? WHERE id=?""",
+               dns_lookback_hours=?, dns_query_count=?, dns_research_status=NULL,
+               dns_research_sources=NULL, dns_researched_at=NULL, dns_research_error=NULL,
+               updated_at=? WHERE id=?""",
             (
                 report["identity"], report["confidence"], report["summary"], json.dumps(report["evidence"]),
                 json.dumps(report["domains"]), json.dumps(report["source_summary"]), now, hours,
                 report["query_count"], now, device_id,
             ),
         )
-    report["research_queued"] = queue_dns_research(device_id, report, row_to_dict(device))
     return report
 
 
@@ -1897,6 +1881,7 @@ def status_payload():
         "pihole_sources": pihole_service.public_sources(),
         "last_pihole_test": get_setting("last_pihole_test"),
         "last_pihole_error": get_setting("last_pihole_error"),
+        "dns_research_available": DNS_RESEARCH_ENABLED and bool(OPENAI_API_KEY),
     }
 
 
@@ -2000,6 +1985,25 @@ def dns_analysis(device_id):
                 (message, utc_now(), device_id),
             )
         return jsonify({"ok": False, "message": message}), 502
+
+
+@app.post("/api/devices/<int:device_id>/dns-research")
+def dns_research(device_id):
+    with db_connection() as conn:
+        row = conn.execute("SELECT * FROM devices WHERE id=?", (device_id,)).fetchone()
+    if not row:
+        return jsonify({"ok": False, "message": "Device not found."}), 404
+    device = row_to_dict(row)
+    if not device.get("dns_scanned_at"):
+        return jsonify({"ok": False, "message": "Run DNS analysis first."}), 400
+    if device.get("dns_research_status") in {"queued", "running"}:
+        return jsonify({"ok": False, "message": "AI analysis is already running."}), 409
+    try:
+        domains = [item.get("domain", "") for item in device.get("dns_domains", [])]
+        queue_dns_research(device_id, domains)
+        return jsonify({"ok": True, "message": "AI analysis of DNS traffic started in the background."}), 202
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 503
 
 
 @app.post("/api/pihole/connect")

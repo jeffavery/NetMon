@@ -111,6 +111,9 @@ function openDevice(device) {
   $('#scanPortsButton').disabled = !device.ip;
   $('#deepScanButton').disabled = !device.ip;
   $('#dnsAnalyzeButton').disabled = !state.status.pihole_connected || !(device.ip || device.reserved_ip);
+  const canResearchDns = state.status.dns_research_available && device.dns_scanned_at && (device.dns_domains || []).length;
+  $('#dnsResearchButton').classList.toggle('hidden', !canResearchDns);
+  $('#dnsResearchButton').disabled = ['queued', 'running'].includes(device.dns_research_status);
   renderIdentity(device);
   renderDnsAnalysis(device);
   renderHaMatch(device);
@@ -322,7 +325,7 @@ $('#dnsAnalyzeButton').addEventListener('click', async () => {
   $('#dnsHelp').textContent = 'Reading and comparing DNS history from both Pi-hole servers. Longer periods may take a minute.';
   try {
     const data = await api(`/api/devices/${state.activeDevice.id}/dns-analysis`, {method:'POST', body:JSON.stringify({hours:Number($('#dnsLookback').value)})});
-    showNotice(`${data.message}${data.report.research_queued ? ' Researching unfamiliar domains in the background.' : ''}`);
+    showNotice(data.message);
     await loadDevices();
     const updated = state.devices.find(device => device.id === state.activeDevice.id);
     if (updated) openDevice(updated);
@@ -332,6 +335,24 @@ $('#dnsAnalyzeButton').addEventListener('click', async () => {
   } finally {
     button.disabled = !state.status.pihole_connected;
     button.textContent = 'Analyze DNS';
+  }
+});
+
+$('#dnsResearchButton').addEventListener('click', async () => {
+  const button = $('#dnsResearchButton');
+  button.disabled = true;
+  button.textContent = 'Starting AI analysis…';
+  try {
+    const data = await api(`/api/devices/${state.activeDevice.id}/dns-research`, {method:'POST'});
+    showNotice(data.message);
+    await loadDevices();
+    const updated = state.devices.find(device => device.id === state.activeDevice.id);
+    if (updated) openDevice(updated);
+  } catch (error) {
+    showNotice(error.message, true);
+  } finally {
+    button.textContent = 'AI analysis of DNS traffic';
+    if (!['queued', 'running'].includes(state.activeDevice?.dns_research_status)) button.disabled = false;
   }
 });
 
